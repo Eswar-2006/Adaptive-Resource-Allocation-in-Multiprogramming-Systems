@@ -1,24 +1,62 @@
-# Adaptive Resource Allocation in Multiprogramming Systems
+# 🚀 Adaptive Resource Allocation in Multiprogramming Systems
 
-This project simulates and logs operating-system style resource allocation in a multiprogramming environment.
+> 🧠 Simulating intelligent OS-level resource allocation with real-time logging & database tracking
 
-## Contents
+---
 
-- `os project file.py`: main Python implementation
-- `allocation_logs.db`: SQLite database for allocation logs
-- `resource_logs.db`: SQLite database for resource activity logs
+## 📌 Overview
 
-## Requirements
+This project models how an operating system dynamically allocates resources in a multiprogramming environment.
+It tracks process execution, resource usage, and allocation decisions using persistent storage.
 
-- Python 3.9+
+✨ Designed to demonstrate:
+- Efficient CPU & resource utilization
+- Real-time allocation logging
+- OS-level scheduling concepts
 
-## Run
+---
 
-```bash
-python "os project file.py"
+## 🧩 Project Structure
+
+```
+.
+├── os project file.py # Main simulation script
+├── allocation_logs.db # Stores allocation history
+├── resource_logs.db # Stores resource usage logs
+└── README.md # Documentation
 ```
 
-## Notes
+---
 
-- The project stores runtime information in local SQLite database files.
-- Keep database files if you want to preserve logs between runs.
+## ⚙️ Features
+
+- Dynamic resource allocation simulation
+- Multiprogramming environment modeling
+- SQLite-based persistent logging
+- Lightweight & easy to run
+- Clean and extendable Python code
+
+---
+
+## 🛠️ Tech Stack
+
+| Component | Technology |
+| --- | --- |
+| Language | Python 3.9+ |
+| Database | SQLite |
+| Concept Domain | Operating Systems |
+
+---
+
+## ▶️ How to Run
+
+```bash
+# Clone the repository
+git clone https://github.com/Eswar-2006/Adaptive-Resource-Allocation-in-Multiprogramming-Systems.git
+
+# Navigate to project directory
+cd Adaptive-Resource-Allocation-in-Multiprogramming-Systems
+
+# Run the simulation
+python "os project file.py"
+```
