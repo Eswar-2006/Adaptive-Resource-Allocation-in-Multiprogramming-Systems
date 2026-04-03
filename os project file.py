@@ -141,10 +141,13 @@ class AdaptiveAllocator:
     def _record_telemetry(self, real_avail_cpu, real_avail_mem_mb, total_req_cpu, total_req_mem,
                           total_alloc_cpu, total_alloc_mem):
         timestamp = pd.Timestamp.now().strftime("%H:%M:%S")
-        self.cursor.execute("INSERT INTO AllocationStats VALUES (?, ?, ?, ?, ?, ?, ?)",
-                            (timestamp, real_avail_cpu, real_avail_mem_mb,
-                             total_req_cpu, total_req_mem, total_alloc_cpu, total_alloc_mem))
-        self.conn.commit()
+        try:
+            self.cursor.execute("INSERT INTO AllocationStats VALUES (?, ?, ?, ?, ?, ?, ?)",
+                                (timestamp, real_avail_cpu, real_avail_mem_mb,
+                                 total_req_cpu, total_req_mem, total_alloc_cpu, total_alloc_mem))
+            self.conn.commit()
+        except sqlite3.Error as error:
+            print(f"Telemetry write failed: {error}")
 
     def allocate_resources(self, tick):
         real_avail_cpu, real_avail_mem_mb = self._measure_system_capacity()
@@ -180,12 +183,18 @@ class AdaptiveAllocator:
         )
 
     def get_data(self):
-        return pd.read_sql("SELECT * FROM AllocationStats", self.conn)
+        try:
+            return pd.read_sql("SELECT * FROM AllocationStats", self.conn)
+        except (sqlite3.Error, ValueError) as error:
+            print(f"Unable to read allocation data: {error}")
+            return pd.DataFrame()
 
     def predict_next_tick(self):
         """Uses ML to predict system resource availability trend for next tick."""
         df = self.get_data()
-        if len(df) < 5: return
+        if len(df) < 5:
+            print("\n[ML Predict] Not enough data to generate a trend prediction.")
+            return
         
         X = np.arange(len(df)).reshape(-1, 1)
         model_cpu = LinearRegression().fit(X, df["real_avail_cpu"].values)
@@ -199,7 +208,9 @@ class AdaptiveAllocator:
 
     def plot_analytics(self):
         df = self.get_data()
-        if df.empty: return
+        if df.empty:
+            print("No telemetry data available for plotting.")
+            return
 
         fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 8))
 
@@ -226,7 +237,12 @@ class AdaptiveAllocator:
         plt.show()
 
     def close(self):
-        if self.conn: self.conn.close()
+        if self.conn:
+            try:
+                self.conn.close()
+            finally:
+                self.conn = None
+                self.cursor = None
 
 def main():
     print("Initializing Adaptive OS Resource Allocation Simulation...")
