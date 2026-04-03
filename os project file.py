@@ -10,6 +10,7 @@ from sklearn.linear_model import LinearRegression
 DEFAULT_DB_NAME = "allocation_logs.db"
 DEFAULT_TICK_COUNT = 15
 DEFAULT_TICK_DELAY_SECONDS = 1
+MIN_PREDICTION_POINTS = 5
 DEFAULT_PROCESS_SPECS = [
     (1, 'CPU-Intensive'),
     (2, 'Memory-Intensive'),
@@ -149,6 +150,13 @@ class AdaptiveAllocator:
         except sqlite3.Error as error:
             print(f"Telemetry write failed: {error}")
 
+    def _describe_trend(self, slope):
+        if slope > 0.05:
+            return "increasing"
+        if slope < -0.05:
+            return "decreasing"
+        return "stable"
+
     def allocate_resources(self, tick):
         real_avail_cpu, real_avail_mem_mb = self._measure_system_capacity()
         requests, total_req_cpu, total_req_mem = self._collect_requests()
@@ -192,7 +200,7 @@ class AdaptiveAllocator:
     def predict_next_tick(self):
         """Uses ML to predict system resource availability trend for next tick."""
         df = self.get_data()
-        if len(df) < 5:
+        if len(df) < MIN_PREDICTION_POINTS:
             print("\n[ML Predict] Not enough data to generate a trend prediction.")
             return
         
@@ -203,8 +211,14 @@ class AdaptiveAllocator:
         next_t = np.array([[len(df)]])
         pred_cpu = max(0, min(100, model_cpu.predict(next_t)[0]))
         pred_mem = max(0, model_mem.predict(next_t)[0])
+        cpu_trend = self._describe_trend(model_cpu.coef_[0])
+        mem_trend = self._describe_trend(model_mem.coef_[0])
 
-        print(f"\n[ML Predict] Trend for Next Tick -> Est. Avail CPU: {pred_cpu:.1f}%, Est. Avail Mem: {pred_mem:.1f} MB")
+        print(
+            "\n[ML Predict] Trend for Next Tick -> "
+            f"Est. Avail CPU: {pred_cpu:.1f}% ({cpu_trend}), "
+            f"Est. Avail Mem: {pred_mem:.1f} MB ({mem_trend})"
+        )
 
     def plot_analytics(self):
         df = self.get_data()
@@ -233,6 +247,7 @@ class AdaptiveAllocator:
         ax2.grid(True, alpha=0.3)
 
         plt.xlabel("Simulation Tick")
+        fig.suptitle("Adaptive Resource Allocation Analysis", fontsize=12, fontweight="bold")
         plt.tight_layout()
         plt.show()
 
