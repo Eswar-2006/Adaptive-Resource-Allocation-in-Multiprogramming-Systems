@@ -7,6 +7,17 @@ import numpy as np
 import matplotlib.pyplot as plt
 from sklearn.linear_model import LinearRegression
 
+DEFAULT_DB_NAME = "allocation_logs.db"
+DEFAULT_TICK_COUNT = 15
+DEFAULT_TICK_DELAY_SECONDS = 1
+DEFAULT_PROCESS_SPECS = [
+    (1, 'CPU-Intensive'),
+    (2, 'Memory-Intensive'),
+    (3, 'Balanced'),
+    (4, 'CPU-Intensive'),
+    (5, 'Balanced')
+]
+
 class VirtualProcess:
     """Simulates a process with specific resource demands."""
     def __init__(self, pid, workload_type):
@@ -36,24 +47,25 @@ class AdaptiveAllocator:
     Simulates an OS scheduler that adaptively allocates real available 
     system resources to virtual processes.
     """
-    def __init__(self, db_name="allocation_logs.db"):
+    def __init__(self, db_name=DEFAULT_DB_NAME):
         self.db_name = db_name
-        self.processes = [
-            VirtualProcess(1, 'CPU-Intensive'),
-            VirtualProcess(2, 'Memory-Intensive'),
-            VirtualProcess(3, 'Balanced'),
-            VirtualProcess(4, 'CPU-Intensive'),
-            VirtualProcess(5, 'Balanced')
-        ]
+        self.processes = self._create_default_processes()
         self.conn = None
         self.cursor = None
         self._setup_db()
         psutil.cpu_percent(interval=0.1) # Prime the CPU monitor
 
+    def _create_default_processes(self):
+        return [VirtualProcess(pid, workload_type) for pid, workload_type in DEFAULT_PROCESS_SPECS]
+
     def _setup_db(self):
         self.conn = sqlite3.connect(self.db_name)
         self.cursor = self.conn.cursor()
-        self.cursor.execute("DROP TABLE IF EXISTS AllocationStats") # Reset for fresh simulation
+        self._initialize_allocation_stats_table()
+        self.conn.commit()
+
+    def _initialize_allocation_stats_table(self):
+        self.cursor.execute("DROP TABLE IF EXISTS AllocationStats")
         self.cursor.execute("""
             CREATE TABLE AllocationStats (
                 timestamp TEXT,
@@ -65,86 +77,107 @@ class AdaptiveAllocator:
                 total_allocated_mem REAL
             )
         """)
-        self.conn.commit()
 
-    def allocate_resources(self, tick):
-        # 1. Measure REAL time system resources constraints
+    def _measure_system_capacity(self):
         real_used_cpu = psutil.cpu_percent(interval=None)
-        # Cap usable CPU to what's actually free on the real machine
-        real_avail_cpu = max(0.0, 100.0 - real_used_cpu) 
-        
+        real_avail_cpu = max(0.0, 100.0 - real_used_cpu)
+
         mem_info = psutil.virtual_memory()
         real_avail_mem_mb = mem_info.available / (1024 * 1024)
 
+        return real_avail_cpu, real_avail_mem_mb
+
+    def _collect_requests(self):
         requests = []
         total_req_cpu = 0
         total_req_mem = 0
 
-        # 2. Gather process requests and apply Aging (prevent starvation)
-        for p in self.processes:
-            if p.wait_time > 2:
-                # Priority boost if starved for multiple ticks
-                p.priority = max(1, p.priority - 2)
-                p.wait_time = 0
-                
-            req_cpu, req_mem = p.generate_requests()
-            requests.append({'process': p, 'req_cpu': req_cpu, 'req_mem': req_mem})
+        for process in self.processes:
+            if process.wait_time > 2:
+                process.priority = max(1, process.priority - 2)
+                process.wait_time = 0
+
+            req_cpu, req_mem = process.generate_requests()
+            requests.append({'process': process, 'req_cpu': req_cpu, 'req_mem': req_mem})
             total_req_cpu += req_cpu
             total_req_mem += req_mem
 
-        # 3. Priority-based Allocation
         requests.sort(key=lambda item: item['process'].priority)
+        return requests, total_req_cpu, total_req_mem
+
+    def _apply_request_allocation(self, request, avail_cpu_pool, avail_mem_pool):
+        process = request['process']
+        cpu_needed = request['req_cpu']
+        mem_needed = request['req_mem']
+
+        if avail_cpu_pool >= cpu_needed:
+            process.allocated_cpu = cpu_needed
+            avail_cpu_pool -= cpu_needed
+        else:
+            process.allocated_cpu = avail_cpu_pool
+            avail_cpu_pool = 0
+
+        if avail_mem_pool >= mem_needed:
+            process.allocated_mem = mem_needed
+            avail_mem_pool -= mem_needed
+        else:
+            process.allocated_mem = avail_mem_pool
+            avail_mem_pool = 0
+
+        if process.allocated_cpu < cpu_needed or process.allocated_mem < mem_needed:
+            process.wait_time += 1
+        else:
+            process.priority = min(10, process.priority + 1)
+            process.wait_time = 0
+
+        return avail_cpu_pool, avail_mem_pool
+
+    def _print_request_status(self, process, cpu_needed, mem_needed):
+        now_ts = pd.Timestamp.now().strftime("%H:%M:%S.%f")[:-3]
+        print(f"[{now_ts}] PID {process.pid} ({process.workload_type[:4]:^4}) | Prio: {process.priority:2d} | "
+              f"Req: {cpu_needed:4.1f}% CPU, {mem_needed:4.1f}MB Mem | "
+              f"Alloc: {process.allocated_cpu:4.1f}% CPU, {process.allocated_mem:4.1f}MB Mem")
+
+    def _record_telemetry(self, real_avail_cpu, real_avail_mem_mb, total_req_cpu, total_req_mem,
+                          total_alloc_cpu, total_alloc_mem):
+        timestamp = pd.Timestamp.now().strftime("%H:%M:%S")
+        self.cursor.execute("INSERT INTO AllocationStats VALUES (?, ?, ?, ?, ?, ?, ?)",
+                            (timestamp, real_avail_cpu, real_avail_mem_mb,
+                             total_req_cpu, total_req_mem, total_alloc_cpu, total_alloc_mem))
+        self.conn.commit()
+
+    def allocate_resources(self, tick):
+        real_avail_cpu, real_avail_mem_mb = self._measure_system_capacity()
+        requests, total_req_cpu, total_req_mem = self._collect_requests()
 
         avail_cpu_pool = real_avail_cpu
         avail_mem_pool = real_avail_mem_mb
-        
         total_alloc_cpu = 0
         total_alloc_mem = 0
 
         print(f"\n--- Tick {tick} | Real Avail: [CPU: {real_avail_cpu:.1f}%] [Mem: {real_avail_mem_mb:.1f} MB] ---")
         
-        for req in requests:
-            p = req['process']
-            cpu_needed = req['req_cpu']
-            mem_needed = req['req_mem']
+        for request in requests:
+            process = request['process']
+            cpu_needed = request['req_cpu']
+            mem_needed = request['req_mem']
 
-            # CPU Allocation
-            if avail_cpu_pool >= cpu_needed:
-                p.allocated_cpu = cpu_needed
-                avail_cpu_pool -= cpu_needed
-            else:
-                p.allocated_cpu = avail_cpu_pool
-                avail_cpu_pool = 0
+            avail_cpu_pool, avail_mem_pool = self._apply_request_allocation(
+                request, avail_cpu_pool, avail_mem_pool
+            )
 
-            # Memory Allocation
-            if avail_mem_pool >= mem_needed:
-                p.allocated_mem = mem_needed
-                avail_mem_pool -= mem_needed
-            else:
-                p.allocated_mem = avail_mem_pool
-                avail_mem_pool = 0
+            total_alloc_cpu += process.allocated_cpu
+            total_alloc_mem += process.allocated_mem
+            self._print_request_status(process, cpu_needed, mem_needed)
 
-            total_alloc_cpu += p.allocated_cpu
-            total_alloc_mem += p.allocated_mem
-
-            # Feedback Loop: Modify priority based on allocation success
-            if p.allocated_cpu < cpu_needed or p.allocated_mem < mem_needed:
-                p.wait_time += 1 # Starved
-            else:
-                p.priority = min(10, p.priority + 1) # Fully satisfied, lower priority
-                p.wait_time = 0
-
-            now_ts = pd.Timestamp.now().strftime("%H:%M:%S.%f")[:-3]
-            print(f"[{now_ts}] PID {p.pid} ({p.workload_type[:4]:^4}) | Prio: {p.priority:2d} | "
-                  f"Req: {cpu_needed:4.1f}% CPU, {mem_needed:4.1f}MB Mem | "
-                  f"Alloc: {p.allocated_cpu:4.1f}% CPU, {p.allocated_mem:4.1f}MB Mem")
-
-        # 4. Record Telemetry
-        timestamp = pd.Timestamp.now().strftime("%H:%M:%S")
-        self.cursor.execute("INSERT INTO AllocationStats VALUES (?, ?, ?, ?, ?, ?, ?)",
-                            (timestamp, real_avail_cpu, real_avail_mem_mb, 
-                             total_req_cpu, total_req_mem, total_alloc_cpu, total_alloc_mem))
-        self.conn.commit()
+        self._record_telemetry(
+            real_avail_cpu,
+            real_avail_mem_mb,
+            total_req_cpu,
+            total_req_mem,
+            total_alloc_cpu,
+            total_alloc_mem,
+        )
 
     def get_data(self):
         return pd.read_sql("SELECT * FROM AllocationStats", self.conn)
@@ -201,9 +234,9 @@ def main():
     
     allocator = AdaptiveAllocator()
     try:
-        for tick in range(1, 16): # 15 ticks of simulation
+        for tick in range(1, DEFAULT_TICK_COUNT + 1):
             allocator.allocate_resources(tick)
-            time.sleep(1) # Simulate real-time delay
+            time.sleep(DEFAULT_TICK_DELAY_SECONDS)
             
         allocator.predict_next_tick()
         
