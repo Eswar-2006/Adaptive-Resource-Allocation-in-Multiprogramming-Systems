@@ -259,9 +259,21 @@ class AdaptiveAllocator:
                 self.conn = None
                 self.cursor = None
 
+
+def validate_runtime_config():
+    if DEFAULT_TICK_COUNT <= 0:
+        raise ValueError("DEFAULT_TICK_COUNT must be greater than 0")
+    if DEFAULT_TICK_DELAY_SECONDS < 0:
+        raise ValueError("DEFAULT_TICK_DELAY_SECONDS cannot be negative")
+    if len(DEFAULT_PROCESS_SPECS) == 0:
+        raise ValueError("DEFAULT_PROCESS_SPECS must include at least one process")
+
 def main():
     print("Initializing Adaptive OS Resource Allocation Simulation...")
     print("Binding simulated requests to REAL system availability bounds.\n")
+
+    validate_runtime_config()
+    print("Runtime configuration validation passed.")
     
     allocator = AdaptiveAllocator()
     try:
