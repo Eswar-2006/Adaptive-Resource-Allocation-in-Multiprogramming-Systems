@@ -60,3 +60,10 @@ cd Adaptive-Resource-Allocation-in-Multiprogramming-Systems
 # Run the simulation
 python "os project file.py"
 ```
+
+## 🧪 Runtime Notes
+
+- The simulation runs for 15 ticks by default.
+- Runtime configuration is validated before execution begins.
+- Allocation telemetry is written to SQLite on every tick.
+- Trend prediction is shown after enough samples are collected.
