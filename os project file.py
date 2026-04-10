@@ -11,6 +11,9 @@ DEFAULT_DB_NAME = "allocation_logs.db"
 DEFAULT_TICK_COUNT = 15
 DEFAULT_TICK_DELAY_SECONDS = 1
 MIN_PREDICTION_POINTS = 5
+EWMA_ALPHA = 0.35
+BOTTLENECK_PRESSURE_THRESHOLD = 0.85
+MIN_RESOURCE_SLICE = 0.5
 DEFAULT_PROCESS_SPECS = [
     (1, 'CPU-Intensive'),
     (2, 'Memory-Intensive'),
@@ -28,6 +31,7 @@ class VirtualProcess:
         self.allocated_cpu = 0.0
         self.allocated_mem = 0.0 # in MB
         self.wait_time = 0
+        self.starvation_credit = 0.0
 
     def generate_requests(self):
         # Generate resource requests based on workload profile
@@ -53,6 +57,8 @@ class AdaptiveAllocator:
         self.processes = self._create_default_processes()
         self.conn = None
         self.cursor = None
+        self.cpu_pressure_ewma = 0.0
+        self.mem_pressure_ewma = 0.0
         self._setup_db()
         psutil.cpu_percent(interval=0.1) # Prime the CPU monitor
 
@@ -75,7 +81,10 @@ class AdaptiveAllocator:
                 total_requested_cpu REAL,
                 total_requested_mem REAL,
                 total_allocated_cpu REAL,
-                total_allocated_mem REAL
+                total_allocated_mem REAL,
+                cpu_pressure REAL,
+                mem_pressure REAL,
+                bottleneck_state TEXT
             )
         """)
 
@@ -105,6 +114,144 @@ class AdaptiveAllocator:
 
         requests.sort(key=lambda item: item['process'].priority)
         return requests, total_req_cpu, total_req_mem
+
+    def _update_ewma(self, previous, current):
+        return (EWMA_ALPHA * current) + ((1 - EWMA_ALPHA) * previous)
+
+    def _pressure(self, total_requested, total_available):
+        if total_available <= 0:
+            return 1.0 if total_requested > 0 else 0.0
+        return min(1.0, total_requested / total_available)
+
+    def _get_bottleneck_state(self, cpu_pressure, mem_pressure):
+        cpu_hot = cpu_pressure >= BOTTLENECK_PRESSURE_THRESHOLD
+        mem_hot = mem_pressure >= BOTTLENECK_PRESSURE_THRESHOLD
+        if cpu_hot and mem_hot:
+            return "cpu+mem"
+        if cpu_hot:
+            return "cpu"
+        if mem_hot:
+            return "memory"
+        return "none"
+
+    def _compute_process_weight(self, process, cpu_pressure, mem_pressure):
+        fairness_boost = 1.0 + (0.35 * process.wait_time) + process.starvation_credit
+        priority_boost = (11 - process.priority) / 10.0
+
+        workload_bias = 1.0
+        if process.workload_type == 'CPU-Intensive' and cpu_pressure > 0.7:
+            workload_bias += 0.25
+        elif process.workload_type == 'Memory-Intensive' and mem_pressure > 0.7:
+            workload_bias += 0.25
+        elif process.workload_type == 'Balanced':
+            workload_bias += 0.1
+
+        return max(0.1, fairness_boost * priority_boost * workload_bias)
+
+    def _adaptive_allocate(self, requests, avail_cpu_pool, avail_mem_pool, cpu_pressure, mem_pressure):
+        if not requests:
+            return 0.0, 0.0
+
+        weights = {
+            request['process'].pid: self._compute_process_weight(request['process'], cpu_pressure, mem_pressure)
+            for request in requests
+        }
+        weight_sum = sum(weights.values())
+
+        process_allocations = {}
+        for request in requests:
+            process = request['process']
+            process_allocations[process.pid] = {
+                'cpu': 0.0,
+                'mem': 0.0,
+                'req_cpu': request['req_cpu'],
+                'req_mem': request['req_mem'],
+                'process': process,
+            }
+
+        # Pass 1: weighted fair-share allocation under current pressure.
+        for request in requests:
+            process = request['process']
+            pid = process.pid
+            weight = weights[pid]
+
+            cpu_target = avail_cpu_pool * (weight / weight_sum)
+            mem_target = avail_mem_pool * (weight / weight_sum)
+
+            cpu_alloc = min(request['req_cpu'], max(MIN_RESOURCE_SLICE, cpu_target))
+            mem_alloc = min(request['req_mem'], max(MIN_RESOURCE_SLICE, mem_target))
+
+            cpu_alloc = min(cpu_alloc, avail_cpu_pool)
+            mem_alloc = min(mem_alloc, avail_mem_pool)
+
+            process_allocations[pid]['cpu'] += cpu_alloc
+            process_allocations[pid]['mem'] += mem_alloc
+            avail_cpu_pool -= cpu_alloc
+            avail_mem_pool -= mem_alloc
+
+        # Pass 2: reallocate leftover resources to highest unmet weighted demand.
+        for _ in range(2):
+            if avail_cpu_pool <= 0 and avail_mem_pool <= 0:
+                break
+
+            cpu_unmet_weight = sum(
+                max(0.0, process_allocations[r['process'].pid]['req_cpu'] - process_allocations[r['process'].pid]['cpu'])
+                * weights[r['process'].pid]
+                for r in requests
+            )
+            mem_unmet_weight = sum(
+                max(0.0, process_allocations[r['process'].pid]['req_mem'] - process_allocations[r['process'].pid]['mem'])
+                * weights[r['process'].pid]
+                for r in requests
+            )
+
+            for request in requests:
+                process = request['process']
+                pid = process.pid
+                entry = process_allocations[pid]
+                weight = weights[pid]
+
+                cpu_unmet = max(0.0, entry['req_cpu'] - entry['cpu'])
+                mem_unmet = max(0.0, entry['req_mem'] - entry['mem'])
+
+                if avail_cpu_pool > 0 and cpu_unmet > 0 and cpu_unmet_weight > 0:
+                    cpu_share = avail_cpu_pool * ((cpu_unmet * weight) / cpu_unmet_weight)
+                    cpu_gain = min(cpu_unmet, cpu_share, avail_cpu_pool)
+                    entry['cpu'] += cpu_gain
+                    avail_cpu_pool -= cpu_gain
+
+                if avail_mem_pool > 0 and mem_unmet > 0 and mem_unmet_weight > 0:
+                    mem_share = avail_mem_pool * ((mem_unmet * weight) / mem_unmet_weight)
+                    mem_gain = min(mem_unmet, mem_share, avail_mem_pool)
+                    entry['mem'] += mem_gain
+                    avail_mem_pool -= mem_gain
+
+        total_alloc_cpu = 0.0
+        total_alloc_mem = 0.0
+        for request in requests:
+            process = request['process']
+            pid = process.pid
+            alloc_cpu = process_allocations[pid]['cpu']
+            alloc_mem = process_allocations[pid]['mem']
+
+            process.allocated_cpu = alloc_cpu
+            process.allocated_mem = alloc_mem
+            total_alloc_cpu += alloc_cpu
+            total_alloc_mem += alloc_mem
+
+            cpu_fulfilled = alloc_cpu >= request['req_cpu'] * 0.95
+            mem_fulfilled = alloc_mem >= request['req_mem'] * 0.95
+
+            if cpu_fulfilled and mem_fulfilled:
+                process.priority = min(10, process.priority + 1)
+                process.wait_time = 0
+                process.starvation_credit = max(0.0, process.starvation_credit - 0.25)
+            else:
+                process.wait_time += 1
+                process.priority = max(1, process.priority - 1)
+                process.starvation_credit = min(2.0, process.starvation_credit + 0.2)
+
+        return total_alloc_cpu, total_alloc_mem
 
     def _apply_request_allocation(self, request, avail_cpu_pool, avail_mem_pool):
         process = request['process']
@@ -140,12 +287,14 @@ class AdaptiveAllocator:
               f"Alloc: {process.allocated_cpu:4.1f}% CPU, {process.allocated_mem:4.1f}MB Mem")
 
     def _record_telemetry(self, real_avail_cpu, real_avail_mem_mb, total_req_cpu, total_req_mem,
-                          total_alloc_cpu, total_alloc_mem):
+                          total_alloc_cpu, total_alloc_mem, cpu_pressure, mem_pressure,
+                          bottleneck_state):
         timestamp = pd.Timestamp.now().strftime("%H:%M:%S")
         try:
-            self.cursor.execute("INSERT INTO AllocationStats VALUES (?, ?, ?, ?, ?, ?, ?)",
+            self.cursor.execute("INSERT INTO AllocationStats VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                                 (timestamp, real_avail_cpu, real_avail_mem_mb,
-                                 total_req_cpu, total_req_mem, total_alloc_cpu, total_alloc_mem))
+                                 total_req_cpu, total_req_mem, total_alloc_cpu, total_alloc_mem,
+                                 cpu_pressure, mem_pressure, bottleneck_state))
             self.conn.commit()
         except sqlite3.Error as error:
             print(f"Telemetry write failed: {error}")
@@ -161,25 +310,29 @@ class AdaptiveAllocator:
         real_avail_cpu, real_avail_mem_mb = self._measure_system_capacity()
         requests, total_req_cpu, total_req_mem = self._collect_requests()
 
-        avail_cpu_pool = real_avail_cpu
-        avail_mem_pool = real_avail_mem_mb
-        total_alloc_cpu = 0
-        total_alloc_mem = 0
+        cpu_pressure = self._pressure(total_req_cpu, real_avail_cpu)
+        mem_pressure = self._pressure(total_req_mem, real_avail_mem_mb)
+        self.cpu_pressure_ewma = self._update_ewma(self.cpu_pressure_ewma, cpu_pressure)
+        self.mem_pressure_ewma = self._update_ewma(self.mem_pressure_ewma, mem_pressure)
+        bottleneck_state = self._get_bottleneck_state(self.cpu_pressure_ewma, self.mem_pressure_ewma)
 
-        print(f"\n--- Tick {tick} | Real Avail: [CPU: {real_avail_cpu:.1f}%] [Mem: {real_avail_mem_mb:.1f} MB] ---")
-        
+        print(
+            f"\n--- Tick {tick} | Real Avail: [CPU: {real_avail_cpu:.1f}%] [Mem: {real_avail_mem_mb:.1f} MB] "
+            f"| Pressure: [CPU: {self.cpu_pressure_ewma:.2f}] [Mem: {self.mem_pressure_ewma:.2f}] "
+            f"| Bottleneck: {bottleneck_state} ---"
+        )
+
+        total_alloc_cpu, total_alloc_mem = self._adaptive_allocate(
+            requests,
+            real_avail_cpu,
+            real_avail_mem_mb,
+            self.cpu_pressure_ewma,
+            self.mem_pressure_ewma,
+        )
+
         for request in requests:
             process = request['process']
-            cpu_needed = request['req_cpu']
-            mem_needed = request['req_mem']
-
-            avail_cpu_pool, avail_mem_pool = self._apply_request_allocation(
-                request, avail_cpu_pool, avail_mem_pool
-            )
-
-            total_alloc_cpu += process.allocated_cpu
-            total_alloc_mem += process.allocated_mem
-            self._print_request_status(process, cpu_needed, mem_needed)
+            self._print_request_status(process, request['req_cpu'], request['req_mem'])
 
         self._record_telemetry(
             real_avail_cpu,
@@ -188,6 +341,9 @@ class AdaptiveAllocator:
             total_req_mem,
             total_alloc_cpu,
             total_alloc_mem,
+            self.cpu_pressure_ewma,
+            self.mem_pressure_ewma,
+            bottleneck_state,
         )
 
     def get_data(self):
@@ -267,6 +423,12 @@ def validate_runtime_config():
         raise ValueError("DEFAULT_TICK_DELAY_SECONDS cannot be negative")
     if len(DEFAULT_PROCESS_SPECS) == 0:
         raise ValueError("DEFAULT_PROCESS_SPECS must include at least one process")
+    if not (0 < EWMA_ALPHA <= 1):
+        raise ValueError("EWMA_ALPHA must be in the range (0, 1]")
+    if not (0 < BOTTLENECK_PRESSURE_THRESHOLD <= 1):
+        raise ValueError("BOTTLENECK_PRESSURE_THRESHOLD must be in the range (0, 1]")
+    if MIN_RESOURCE_SLICE < 0:
+        raise ValueError("MIN_RESOURCE_SLICE cannot be negative")
 
 def main():
     print("Initializing Adaptive OS Resource Allocation Simulation...")

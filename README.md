@@ -32,6 +32,9 @@ It tracks process execution, resource usage, and allocation decisions using pers
 
 - Dynamic resource allocation simulation
 - Multiprogramming environment modeling
+- Real-time pressure monitoring for CPU and memory
+- Bottleneck detection using rolling pressure trends
+- Two-pass adaptive reallocation to reduce starvation
 - SQLite-based persistent logging
 - Lightweight & easy to run
 - Clean and extendable Python code
@@ -66,4 +69,7 @@ python "os project file.py"
 - The simulation runs for 15 ticks by default.
 - Runtime configuration is validated before execution begins.
 - Allocation telemetry is written to SQLite on every tick.
+- CPU and memory pressure are tracked each tick using EWMA smoothing.
+- Bottleneck state is reported as `none`, `cpu`, `memory`, or `cpu+mem`.
+- A second allocation pass redistributes remaining resources to unmet weighted demand.
 - Trend prediction is shown after enough samples are collected.
