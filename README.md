@@ -73,3 +73,30 @@ python "os project file.py"
 - Bottleneck state is reported as `none`, `cpu`, `memory`, or `cpu+mem`.
 - A second allocation pass redistributes remaining resources to unmet weighted demand.
 - Trend prediction is shown after enough samples are collected.
+
+## 💻 Interactive Terminal Mode (Real-Time + User Input)
+
+You can now run a fully terminal-based real-time allocator with live demographs and manual control:
+
+```bash
+python nexus7_terminal.py
+```
+
+Supported commands inside terminal mode:
+
+- `help`
+- `mode manual` or `mode auto`
+- `set <pid> <cpu%> <memMB>`
+- `del <pid>`
+- `clear`
+- `quit`
+
+Example:
+
+```text
+mode manual
+set 1 30 400
+set 3 15 220
+```
+
+In manual mode, only user-entered PID requests are used for allocation; any PID without an entry requests `0`.
