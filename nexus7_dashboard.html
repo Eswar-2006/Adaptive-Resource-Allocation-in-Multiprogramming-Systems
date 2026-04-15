@@ -546,6 +546,7 @@ body::after{
     <span class="pill live"><span class="dot"></span><span id="tickPill">TICK 0</span></span>
     <span class="pill" id="schedPill">NEXUS AI</span>
     <span class="pill" id="bottlePill">STABLE</span>
+    <span class="pill" id="collPill">COLLISION 0</span>
     <span class="pill" id="cpuPill">CPU —</span>
     <span class="pill" id="memPill">MEM —</span>
     <span class="pill" id="uptimePill">UP —</span>
@@ -839,6 +840,7 @@ let nexusFocusPid = null;
 let nexusProcessPoints = [];
 let ghostPlaying = false, ghostData = [], ghostIdx = 0;
 let prevBottle = "none";
+let prevCollisionActive = false;
 let activeZoneDPanel = 'gantt';
 let activeZoneCPanel = 'all';
 let activeMainZonePanel = 'all';
@@ -891,6 +893,8 @@ function render(d) {
   updateLegacySummary(d);
   updateManualPanel(d);
   if (d.bottleneck !== "none" && d.bottleneck !== prevBottle) fireShockwave();
+  if ((d.collision?.active) && !prevCollisionActive) fireShockwave();
+  prevCollisionActive = !!(d.collision && d.collision.active);
   prevBottle = d.bottleneck;
 }
 
@@ -1141,6 +1145,21 @@ function updatePills(d) {
   const bp = document.getElementById('bottlePill');
   bp.textContent = bottle === 'none' ? '● STABLE' : `⚠ ${bottle.toUpperCase()}`;
   bp.style.color = bottle === 'none' ? 'var(--green)' : 'var(--red)';
+
+  const coll = d.collision || { active: false, count: 0, level: 'ok', type: 'none' };
+  const cp = document.getElementById('collPill');
+  cp.textContent = coll.active
+    ? `⚠ COLLISION ${coll.type.toUpperCase()} (${coll.count})`
+    : 'COLLISION 0';
+  if (coll.level === 'critical') {
+    cp.style.color = 'var(--red)';
+  } else if (coll.level === 'warn') {
+    cp.style.color = 'var(--gold)';
+  } else {
+    cp.style.color = 'var(--green)';
+  }
+  applyCollisionClass(cp, coll);
+
   document.getElementById('cpuPill').textContent  = `CPU ${d.system.used_cpu.toFixed(1)}%`;
   document.getElementById('memPill').textContent  = `MEM ${d.system.mem_pct.toFixed(1)}%`;
   document.getElementById('uptimePill').textContent = fmtUptime(d.system.uptime_s || 0);
@@ -1386,6 +1405,9 @@ function renderManualDemograph(d) {
 
 // ── Marquee ──
 function updateMarquee(d) {
+  const collisionStatus = d.collision && d.collision.active
+    ? `COLLISION ${d.collision.type.toUpperCase()} (${d.collision.count})`
+    : 'NO COLLISION';
   const items = [
     `TICK ${d.tick}`,
     `${d.scheduler_name.toUpperCase()}`,
@@ -1395,6 +1417,7 @@ function updateMarquee(d) {
     `ALLOC MEM ${d.total_alloc_mem.toFixed(0)}MB`,
     `PRESSURE CPU:${(d.cpu_ewma*100).toFixed(0)}% MEM:${(d.mem_ewma*100).toFixed(0)}%`,
     d.bottleneck === 'none' ? 'SYSTEM STABLE' : `⚠ BOTTLENECK: ${d.bottleneck.toUpperCase()}`,
+    collisionStatus,
     d.explain.slice(0, 60),
   ];
   const doubled = [...items, ...items];
@@ -1935,6 +1958,20 @@ function applySeverityClass(el, pct) {
     return;
   }
   if (pct >= 70) {
+    el.classList.add('alert-warn');
+    return;
+  }
+  el.classList.add('alert-ok');
+}
+
+function applyCollisionClass(el, coll) {
+  if (!el) return;
+  el.classList.remove('alert-ok', 'alert-warn', 'alert-crit');
+  if (coll && coll.level === 'critical') {
+    el.classList.add('alert-crit');
+    return;
+  }
+  if (coll && coll.level === 'warn') {
     el.classList.add('alert-warn');
     return;
   }

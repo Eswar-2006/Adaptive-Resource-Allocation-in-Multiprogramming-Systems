@@ -30,10 +30,47 @@ LEGACY_DB_NAME                = "allocation_logs.db"
 DEFAULT_TICK_DELAY_SECONDS    = 0.5
 MIN_PREDICTION_POINTS         = 5
 EWMA_ALPHA                    = 0.35
-BOTTLENECK_PRESSURE_THRESHOLD = 0.85
 MIN_RESOURCE_SLICE            = 0.5
 GHOST_REPLAY_LEN              = 60   # ticks to remember
 PORT                          = 7800
+
+# Alert profile can be: sensitive, balanced, severe
+ALERT_SENSITIVITY_PROFILE = os.getenv("NEXUS_ALERT_PROFILE", "balanced").strip().lower()
+ALERT_SENSITIVITY_PRESETS = {
+    'sensitive': {
+        'bottleneck_threshold': 0.72,
+        'collision_unfulfilled_ratio': 0.30,
+        'collision_min_request_cpu': 3.0,
+        'collision_min_request_mem': 48.0,
+        'collision_min_participants': 2,
+    },
+    'balanced': {
+        'bottleneck_threshold': 0.85,
+        'collision_unfulfilled_ratio': 0.45,
+        'collision_min_request_cpu': 5.0,
+        'collision_min_request_mem': 64.0,
+        'collision_min_participants': 2,
+    },
+    'severe': {
+        'bottleneck_threshold': 0.93,
+        'collision_unfulfilled_ratio': 0.65,
+        'collision_min_request_cpu': 8.0,
+        'collision_min_request_mem': 128.0,
+        'collision_min_participants': 3,
+    },
+}
+
+
+def _resolve_alert_profile(name: str) -> dict:
+    return ALERT_SENSITIVITY_PRESETS.get(name, ALERT_SENSITIVITY_PRESETS['balanced'])
+
+
+ALERT_CFG = _resolve_alert_profile(ALERT_SENSITIVITY_PROFILE)
+BOTTLENECK_PRESSURE_THRESHOLD = ALERT_CFG['bottleneck_threshold']
+COLLISION_UNFULFILLED_RATIO = ALERT_CFG['collision_unfulfilled_ratio']
+COLLISION_MIN_REQUEST_CPU = ALERT_CFG['collision_min_request_cpu']
+COLLISION_MIN_REQUEST_MEM = ALERT_CFG['collision_min_request_mem']
+COLLISION_MIN_PARTICIPANTS = ALERT_CFG['collision_min_participants']
 
 DEFAULT_PROCESS_SPECS = [
     (1, 'CPU-Intensive'),
@@ -655,6 +692,91 @@ class NexusEngine:
                 proc.priority  = max(1, proc.priority - 1)
                 proc.starvation_credit = min(2.0, proc.starvation_credit + 0.2)
 
+    def _detect_collisions(self, requests) -> dict:
+        """
+        Detect contention collisions when multiple processes are heavily
+        under-fulfilled on the same resource in the same tick.
+        """
+        participants = []
+
+        for req in requests:
+            proc = req['process']
+            req_cpu = float(req.get('req_cpu', 0.0))
+            req_mem = float(req.get('req_mem', 0.0))
+            alloc_cpu = float(getattr(proc, 'allocated_cpu', 0.0))
+            alloc_mem = float(getattr(proc, 'allocated_mem', 0.0))
+
+            cpu_unmet = (1.0 - (alloc_cpu / req_cpu)) if req_cpu > 0 else 0.0
+            mem_unmet = (1.0 - (alloc_mem / req_mem)) if req_mem > 0 else 0.0
+
+            cpu_hot = req_cpu >= COLLISION_MIN_REQUEST_CPU and cpu_unmet >= COLLISION_UNFULFILLED_RATIO
+            mem_hot = req_mem >= COLLISION_MIN_REQUEST_MEM and mem_unmet >= COLLISION_UNFULFILLED_RATIO
+
+            if not (cpu_hot or mem_hot):
+                continue
+
+            if cpu_hot and mem_hot:
+                collision_type = 'dual'
+            elif cpu_hot:
+                collision_type = 'cpu'
+            else:
+                collision_type = 'memory'
+
+            participants.append({
+                'pid': proc.pid,
+                'type': collision_type,
+                'req_cpu': round(req_cpu, 2),
+                'alloc_cpu': round(alloc_cpu, 2),
+                'req_mem': round(req_mem, 2),
+                'alloc_mem': round(alloc_mem, 2),
+                'cpu_unmet_pct': round(max(0.0, cpu_unmet) * 100.0, 1),
+                'mem_unmet_pct': round(max(0.0, mem_unmet) * 100.0, 1),
+            })
+
+        cpu_candidates = [p for p in participants if p['type'] in {'cpu', 'dual'}]
+        mem_candidates = [p for p in participants if p['type'] in {'memory', 'dual'}]
+
+        cpu_collision = len(cpu_candidates) >= COLLISION_MIN_PARTICIPANTS
+        mem_collision = len(mem_candidates) >= COLLISION_MIN_PARTICIPANTS
+
+        if not cpu_collision and not mem_collision:
+            return {
+                'active': False,
+                'count': 0,
+                'type': 'none',
+                'level': 'ok',
+                'events': [],
+            }
+
+        if cpu_collision and mem_collision:
+            collision_type = 'cpu+mem'
+            level = 'critical'
+            relevant = [p for p in participants if p['type'] in {'cpu', 'memory', 'dual'}]
+        elif cpu_collision:
+            collision_type = 'cpu'
+            level = 'warn'
+            relevant = cpu_candidates
+        else:
+            collision_type = 'memory'
+            level = 'warn'
+            relevant = mem_candidates
+
+        # Keep payload compact for websocket updates while preserving top-impact events.
+        ranked = sorted(
+            relevant,
+            key=lambda p: (max(p['cpu_unmet_pct'], p['mem_unmet_pct']), p['pid']),
+            reverse=True,
+        )
+        events = ranked[:6]
+
+        return {
+            'active': True,
+            'count': len(relevant),
+            'type': collision_type,
+            'level': level,
+            'events': events,
+        }
+
     # ── Battle Mode ──────────────────────────────────────────────────────────
     def run_battle(self, requests, avail_cpu, avail_mem, cpu_p, mem_p) -> dict:
         """Run all 5 classical schedulers on the same snapshot, compare metrics."""
@@ -706,6 +828,7 @@ class NexusEngine:
 
         total_alloc_cpu = sum(a['cpu'] for a in allocs)
         total_alloc_mem = sum(a['mem'] for a in allocs)
+        collision = self._detect_collisions(reqs)
 
         # ML prediction
         pred = self.db.predict_next()
@@ -736,6 +859,23 @@ class NexusEngine:
             self._narrate(f"⚠ CPU bottleneck {self.cpu_ewma:.0%}", "warn")
         elif bottle == "memory":
             self._narrate(f"⚠ MEM bottleneck {self.mem_ewma:.0%}", "warn")
+
+        if collision['active']:
+            if collision['level'] == 'critical':
+                self._narrate(
+                    f"⚠ COLLISION: concurrent CPU+MEM contention ({collision['count']} processes)",
+                    "critical",
+                )
+            elif collision['type'] == 'cpu':
+                self._narrate(
+                    f"⚠ CPU collision detected ({collision['count']} processes competing)",
+                    "warn",
+                )
+            elif collision['type'] == 'memory':
+                self._narrate(
+                    f"⚠ MEM collision detected ({collision['count']} processes competing)",
+                    "warn",
+                )
 
         # Histories
         self.cpu_history.append(round(sys['used_cpu'], 1))
@@ -771,11 +911,13 @@ class NexusEngine:
         snapshot = {
             'tick':         self.tick,
             'legacy_rows':  legacy_rows,
+            'alert_profile': ALERT_SENSITIVITY_PROFILE,
             'system':       sys,
             'processes':    [p.to_dict() for p in self.processes],
             'cpu_ewma':     round(self.cpu_ewma, 3),
             'mem_ewma':     round(self.mem_ewma, 3),
             'bottleneck':   bottle,
+            'collision':    collision,
             'total_req_cpu': round(total_req_cpu, 2),
             'total_req_mem': round(total_req_mem, 2),
             'total_alloc_cpu': round(total_alloc_cpu, 2),

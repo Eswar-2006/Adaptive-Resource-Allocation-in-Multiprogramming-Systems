@@ -18,8 +18,49 @@ DEFAULT_DB_NAME = "allocation_logs_terminal.db"
 DEFAULT_TICK_DELAY_SECONDS = 1.0
 MIN_PREDICTION_POINTS = 5
 EWMA_ALPHA = 0.35
-BOTTLENECK_PRESSURE_THRESHOLD = 0.85
 MIN_RESOURCE_SLICE = 0.5
+
+# Alert profile can be: sensitive, balanced, severe
+ALERT_SENSITIVITY_PROFILE = os.getenv(
+    "NEXUS_TERMINAL_ALERT_PROFILE",
+    os.getenv("NEXUS_ALERT_PROFILE", "balanced"),
+).strip().lower()
+ALERT_SENSITIVITY_PRESETS = {
+    "sensitive": {
+        "bottleneck_threshold": 0.72,
+        "collision_unfulfilled_ratio": 0.30,
+        "collision_min_request_cpu": 3.0,
+        "collision_min_request_mem": 48.0,
+        "collision_min_participants": 2,
+    },
+    "balanced": {
+        "bottleneck_threshold": 0.85,
+        "collision_unfulfilled_ratio": 0.45,
+        "collision_min_request_cpu": 5.0,
+        "collision_min_request_mem": 64.0,
+        "collision_min_participants": 2,
+    },
+    "severe": {
+        "bottleneck_threshold": 0.93,
+        "collision_unfulfilled_ratio": 0.65,
+        "collision_min_request_cpu": 8.0,
+        "collision_min_request_mem": 128.0,
+        "collision_min_participants": 3,
+    },
+}
+
+
+def _resolve_alert_profile(name):
+    return ALERT_SENSITIVITY_PRESETS.get(name, ALERT_SENSITIVITY_PRESETS["balanced"])
+
+
+ALERT_CFG = _resolve_alert_profile(ALERT_SENSITIVITY_PROFILE)
+BOTTLENECK_PRESSURE_THRESHOLD = ALERT_CFG["bottleneck_threshold"]
+COLLISION_UNFULFILLED_RATIO = ALERT_CFG["collision_unfulfilled_ratio"]
+COLLISION_MIN_REQUEST_CPU = ALERT_CFG["collision_min_request_cpu"]
+COLLISION_MIN_REQUEST_MEM = ALERT_CFG["collision_min_request_mem"]
+COLLISION_MIN_PARTICIPANTS = ALERT_CFG["collision_min_participants"]
+
 DEFAULT_PROCESS_SPECS = [
     (1, "CPU-Intensive"),
     (2, "Memory-Intensive"),
@@ -169,6 +210,88 @@ class AdaptiveAllocator:
         elif process.workload_type == "Balanced":
             workload_bias += 0.1
         return max(0.1, fairness_boost * priority_boost * workload_bias)
+
+    def _detect_collisions(self, requests):
+        participants = []
+
+        for req in requests:
+            process = req["process"]
+            req_cpu = float(req.get("req_cpu", 0.0))
+            req_mem = float(req.get("req_mem", 0.0))
+            alloc_cpu = float(getattr(process, "allocated_cpu", 0.0))
+            alloc_mem = float(getattr(process, "allocated_mem", 0.0))
+
+            cpu_unmet = (1.0 - (alloc_cpu / req_cpu)) if req_cpu > 0 else 0.0
+            mem_unmet = (1.0 - (alloc_mem / req_mem)) if req_mem > 0 else 0.0
+
+            cpu_hot = req_cpu >= COLLISION_MIN_REQUEST_CPU and cpu_unmet >= COLLISION_UNFULFILLED_RATIO
+            mem_hot = req_mem >= COLLISION_MIN_REQUEST_MEM and mem_unmet >= COLLISION_UNFULFILLED_RATIO
+
+            if not (cpu_hot or mem_hot):
+                continue
+
+            if cpu_hot and mem_hot:
+                collision_type = "dual"
+            elif cpu_hot:
+                collision_type = "cpu"
+            else:
+                collision_type = "memory"
+
+            participants.append(
+                {
+                    "pid": process.pid,
+                    "type": collision_type,
+                    "req_cpu": round(req_cpu, 2),
+                    "alloc_cpu": round(alloc_cpu, 2),
+                    "req_mem": round(req_mem, 2),
+                    "alloc_mem": round(alloc_mem, 2),
+                    "cpu_unmet_pct": round(max(0.0, cpu_unmet) * 100.0, 1),
+                    "mem_unmet_pct": round(max(0.0, mem_unmet) * 100.0, 1),
+                }
+            )
+
+        cpu_candidates = [p for p in participants if p["type"] in {"cpu", "dual"}]
+        mem_candidates = [p for p in participants if p["type"] in {"memory", "dual"}]
+
+        cpu_collision = len(cpu_candidates) >= COLLISION_MIN_PARTICIPANTS
+        mem_collision = len(mem_candidates) >= COLLISION_MIN_PARTICIPANTS
+
+        if not cpu_collision and not mem_collision:
+            return {
+                "active": False,
+                "count": 0,
+                "type": "none",
+                "level": "ok",
+                "events": [],
+            }
+
+        if cpu_collision and mem_collision:
+            collision_type = "cpu+mem"
+            level = "critical"
+            relevant = [p for p in participants if p["type"] in {"cpu", "memory", "dual"}]
+        elif cpu_collision:
+            collision_type = "cpu"
+            level = "warn"
+            relevant = cpu_candidates
+        else:
+            collision_type = "memory"
+            level = "warn"
+            relevant = mem_candidates
+
+        ranked = sorted(
+            relevant,
+            key=lambda p: (max(p["cpu_unmet_pct"], p["mem_unmet_pct"]), p["pid"]),
+            reverse=True,
+        )
+        events = ranked[:6]
+
+        return {
+            "active": True,
+            "count": len(relevant),
+            "type": collision_type,
+            "level": level,
+            "events": events,
+        }
 
     def _adaptive_allocate(self, requests, avail_cpu_pool, avail_mem_pool, cpu_pressure, mem_pressure):
         if not requests:
@@ -334,6 +457,7 @@ class AdaptiveAllocator:
             self.cpu_pressure_ewma,
             self.mem_pressure_ewma,
         )
+        collision = self._detect_collisions(requests)
 
         self._record_telemetry(
             tick,
@@ -351,11 +475,13 @@ class AdaptiveAllocator:
         return {
             "tick": tick,
             "mode": "manual" if self.manual_mode_enabled else "auto",
+            "alert_profile": ALERT_SENSITIVITY_PROFILE,
             "real_avail_cpu": real_avail_cpu,
             "real_avail_mem": real_avail_mem_mb,
             "cpu_pressure": self.cpu_pressure_ewma,
             "mem_pressure": self.mem_pressure_ewma,
             "bottleneck": bottleneck_state,
+            "collision": collision,
             "total_req_cpu": total_req_cpu,
             "total_req_mem": total_req_mem,
             "total_alloc_cpu": total_alloc_cpu,
@@ -434,6 +560,34 @@ class InteractiveTerminalRunner:
             return "yellow"
         return "green"
 
+    def _collision_color(self, collision):
+        if not collision or not collision.get("active"):
+            return "green"
+        if collision.get("level") == "critical":
+            return "red"
+        return "yellow"
+
+    def _collision_banner(self, collision):
+        if not collision or not collision.get("active"):
+            return "Collision: none"
+        ctype = str(collision.get("type", "unknown")).upper()
+        count = int(collision.get("count", 0))
+        return f"Collision: {ctype} ({count} contenders)"
+
+    def _add_collision_tick_msg(self, snapshot):
+        collision = snapshot.get("collision") or {}
+        if not collision.get("active"):
+            return
+        if collision.get("level") == "critical":
+            self._add_msg(
+                f"ALERT tick {snapshot['tick']}: COLLISION CPU+MEM ({collision.get('count', 0)} contenders)"
+            )
+            return
+        ctype = str(collision.get("type", "unknown")).upper()
+        self._add_msg(
+            f"ALERT tick {snapshot['tick']}: COLLISION {ctype} ({collision.get('count', 0)} contenders)"
+        )
+
     def _workload_color(self, workload):
         if workload.startswith("CPU"):
             return "red"
@@ -488,6 +642,12 @@ class InteractiveTerminalRunner:
             + self._c(f"CPU Pressure: {snapshot['cpu_pressure']*100:5.1f}%", "cyan")
             + " | "
             + self._c(f"MEM Pressure: {snapshot['mem_pressure']*100:5.1f}%", "magenta")
+        )
+        print(
+            self._c("Alert Profile: ", "dim")
+            + self._c(snapshot.get("alert_profile", "balanced").upper(), "white", bold=True)
+            + " | "
+            + self._c(self._collision_banner(snapshot.get("collision", {})), self._collision_color(snapshot.get("collision", {})), bold=True)
         )
         print(
             self._c("System Avail -> ", "dim")
@@ -634,6 +794,7 @@ class InteractiveTerminalRunner:
 
                 self.tick += 1
                 snapshot = self.allocator.allocate_resources(self.tick)
+                self._add_collision_tick_msg(snapshot)
                 self._render(snapshot)
                 time.sleep(self.tick_delay)
         finally:
